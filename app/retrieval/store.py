@@ -124,7 +124,9 @@ def search(question, owner_id="local"):
                          "filename": fts_hit["filename"], "source_location": fts_hit["source_location"]},
             # A complete exact-term match is eligible even when its embedding
             # rank was weak or outside ChromaDB's semantic candidate window.
-            "similarity": lexical_similarity,
+            # Scale it by the same lexical weight used for dense hits so an
+            # exact-term match cannot outrank a strong semantic match.
+            "similarity": (1 - lexical_weight) * lexical_similarity,
             "semantic_similarity": None, "lexical_similarity": lexical_similarity,
         })
     logger.info("Retrieval: owner=%s candidates=%d returned=%d", owner_id, candidate_count, len(results))

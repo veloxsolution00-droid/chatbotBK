@@ -51,7 +51,10 @@ def _long_compound_parts(question: str) -> list[str]:
             clauses = re.split(r",\s*(?=(?:and\s+)?(?:what|which|who|when|where|how|whether)\b)", body, flags=re.I)
             clauses = [c.strip(" ,;.") for c in clauses if c.strip(" ,;.")]
             if len(clauses) > 1:
-                fragments.extend(f"{command} {re.sub(r'^(?:and|or)\s+', '', clause, flags=re.I)}" for clause in clauses)
+                # Compute the stripped clause first: a backslash inside an
+                # f-string expression is a SyntaxError on Python < 3.12.
+                stripped = [re.sub(r"^(?:and|or)\s+", "", clause, flags=re.I) for clause in clauses]
+                fragments.extend(f"{command} {clause}" for clause in stripped)
                 continue
         # Split separate coordinated actions, but not ordinary "and" phrases.
         coordinated = re.split(r"\s+and\s+(?=(?:identify|list|explain|compare|contrast|calculate|summari[sz]e|describe|determine|state)\b)", sentence, flags=re.I)
