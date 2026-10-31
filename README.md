@@ -194,4 +194,5 @@ The application uses a bounded, local SQLite cache at `data/metadata/rag_cache.s
 
 Settings: `CACHE_ENABLED=true`, `CACHE_TTL_SECONDS=604800`, `CACHE_MAX_ENTRIES=2000`, `SEMANTIC_RETRIEVAL_THRESHOLD=0.94`, `SEMANTIC_ANSWER_THRESHOLD=0.975`. Disable caching with `CACHE_ENABLED=false` if debugging retrieval.
 #   c h a t b o t B K  
+ #   c h a t b o t B K  
  
