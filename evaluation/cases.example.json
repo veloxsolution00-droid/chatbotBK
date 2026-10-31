@@ -1,0 +1,31 @@
+[
+  {
+    "name": "direct fact with source",
+    "question": "Replace this with a question answered explicitly by your uploaded test policy.",
+    "must_abstain": false,
+    "must_contain": ["replace with a short expected phrase"],
+    "expected_sources": ["your-test-policy.pdf"],
+    "expected_question_type": "factual"
+  },
+  {
+    "name": "unsupported question abstains",
+    "question": "Ask about a fact that is definitely absent from all uploaded test documents.",
+    "must_abstain": true
+  },
+  {
+    "name": "scenario does not invent missing policy",
+    "question": "Ask a hypothetical scenario that depends on a rule absent from the uploaded test policy.",
+    "must_abstain": true,
+    "expected_question_type": "scenario"
+  },
+  {
+    "name": "follow-up context",
+    "question": "What about contractors?",
+    "history": [
+      {"role": "user", "content": "Summarize the uploaded policy's rules for employees."},
+      {"role": "assistant", "content": "The document discusses eligibility and approvals."}
+    ],
+    "must_abstain": false,
+    "expected_question_type": "factual"
+  }
+]

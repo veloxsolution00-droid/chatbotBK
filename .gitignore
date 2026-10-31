@@ -1,0 +1,21 @@
+# Local secrets and runtime configuration
+.env
+
+# Python generated files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Durable runtime data is user-owned; keep folder placeholders in source control.
+data/uploads/*
+!data/uploads/.gitkeep
+data/extracted/*
+!data/extracted/.gitkeep
+data/chroma_db/*
+!data/chroma_db/.gitkeep
+data/metadata/*
+!data/metadata/.gitkeep
+data/logs/*
+!data/logs/.gitkeep
+data/jobs/*
+!data/jobs/.gitkeep
