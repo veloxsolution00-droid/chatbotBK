@@ -66,8 +66,9 @@ def correct_query_from_vocabulary(question: str, vocabulary: list[str], cutoff: 
     """Correct multiple likely typos using terms in the local document index.
 
     This creates an *additional retrieval query*; callers must also search the
-    original question. To avoid corrupting names and identifiers, only lowercase
-    alphabetic words are eligible. Ambiguous fuzzy matches are left unchanged.
+    original question. To avoid corrupting names and identifiers, only alphabetic
+    words are eligible; capitalised words need a stricter match and keep their
+    capitalisation. Ambiguous fuzzy matches are left unchanged.
     """
     if not isinstance(question, str) or not question or not vocabulary:
         return question
@@ -87,12 +88,16 @@ def correct_query_from_vocabulary(question: str, vocabulary: list[str], cutoff: 
     def replace(match):
         token = match.group(0)
         low = token.lower()
-        # Never fuzz identifiers, numbers, acronyms, proper-name-like tokens, or
-        # short/common words. Keep punctuation and original token boundaries.
-        if (len(low) < 5 or not token.isalpha() or not token.islower()
+        # Never fuzz identifiers, numbers, acronyms or short/common words. Keep
+        # punctuation and original token boundaries.
+        if (len(low) < 5 or not token.isalpha()
                 or low in stop or low in vocab):
             return token
-        matches = get_close_matches(low, vocab, n=2, cutoff=cutoff)
+        # Capitalised tokens are usually proper nouns. Correct them too, but only
+        # on a stricter match, and preserve the original capitalisation.
+        capitalised = token[0].isupper() and not token.isupper()
+        threshold = max(cutoff, 0.88) if capitalised else cutoff
+        matches = get_close_matches(low, vocab, n=2, cutoff=threshold)
         if not matches:
             return token
         # If the two best candidates are too close in spelling distance, avoid a
@@ -103,6 +108,6 @@ def correct_query_from_vocabulary(question: str, vocabulary: list[str], cutoff: 
             runner_up = SequenceMatcher(None, low, matches[1]).ratio()
             if best - runner_up < 0.04:
                 return token
-        return matches[0]
+        return matches[0].capitalize() if capitalised else matches[0]
 
     return re.sub(r"\b[\w]+\b", replace, question)

@@ -100,7 +100,7 @@ def test_multi_question_processing_errors_are_not_mislabelled_as_no_evidence(mon
 
     monkeypatch.setattr(chat, "list_docs", lambda owner_id=None: [
         {"document_id": "d1", "processing_status": "indexed", "indexing_status": "complete"}])
-    monkeypatch.setattr(chat, "_answer_one", lambda question, indexed, owner_id: {
+    monkeypatch.setattr(chat, "_answer_one", lambda question, indexed, owner_id, doc_types=None: {
         "question": question, "status": "processing_error", "answer": "Local generation failed.",
         "sources": [], "abstained": True})
     result = chat.answer("First question? Second question?")

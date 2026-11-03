@@ -111,10 +111,22 @@ if q:
             if data.get("question_type"):
                 st.caption("Question type: " + data["question_type"])
             st.caption(f"Status: {data.get('status','unknown')} · Response time: {data.get('response_seconds', '—')} seconds")
+            confidence = data.get("confidence") or {}
+            if confidence.get("label"):
+                score = confidence.get("score")
+                label = confidence["label"]
+                heading = f"Confidence: {label}" + (f" ({score:.0%})" if isinstance(score, (int, float)) else "")
+                (st.success if label == "high" else st.info if label == "medium" else st.warning)(heading)
+                signals = confidence.get("signals") or {}
+                if signals:
+                    st.caption(f"Signals: retrieval similarity {signals.get('retrieval_similarity', '—')} · term coverage {signals.get('term_coverage', '—')} · citation coverage {signals.get('citation_coverage', '—')} · verifier {signals.get('verified', '—')}")
             if retrieval:
                 st.caption(f"Retrieval diagnostics: {retrieval.get('selected_chunks', 0)} chunk(s) selected / {retrieval.get('candidate_chunks', 0)} candidate(s) · best similarity: {retrieval.get('best_similarity', '—')} · threshold: {retrieval.get('min_similarity', '—')} · pass(es): {retrieval.get('retrieval_passes', 1)}")
             citation_check = data.get("citation_validation")
-            if citation_check and not citation_check.get("valid", False):
+            # An abstention also carries an invalid citation block (the refusal has
+            # no [n] markers). Reporting that as a citation failure contradicts the
+            # real status, which is "no answer in the evidence".
+            if data.get("status") == "citation_validation_failed" and citation_check and not citation_check.get("valid", False):
                 st.warning("Citation validation did not pass. The response may have been withheld because its source reference was missing or invalid.")
             verification = data.get("verification") or {}
             if verification.get("checked") and not verification.get("passed"):

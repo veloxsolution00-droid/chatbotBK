@@ -6,6 +6,7 @@ from app.core.config import settings
 from app.storage import database as db
 from app.storage.files import atomic_write
 from app.ingestion.extractor import iter_extract, SUPPORTED
+from app.ingestion.classify import detect_document_type
 from app.retrieval.chunker import chunk_text, digest
 from app.retrieval.store import add, delete, document_chunk_count
 
@@ -44,6 +45,8 @@ def _process_existing(doc, progress_callback=None):
         artifact_path = _artifact_path(docid)
         chunking_started = time.perf_counter()
         source_metadata = []
+        profile_sample = []
+        profile_chars = 0
         extracted_chars = block_count = expected_chunks = 0
         indexed_started = False
         Path(artifact_path).parent.mkdir(parents=True, exist_ok=True)
@@ -65,6 +68,9 @@ def _process_existing(doc, progress_callback=None):
                 temp_handle.write(json.dumps({"source_location": loc, "text": text}, ensure_ascii=False))
                 block_count += 1
                 extracted_chars += len(text)
+                if profile_chars < 60000:
+                    profile_sample.append(text[:60000 - profile_chars])
+                    profile_chars += len(text)
                 source_metadata.append({"source_location": loc})
                 records = [{
                     "id": digest(f"{docid}:{loc}:{i}:{chunk}"), "text": chunk,
@@ -100,10 +106,17 @@ def _process_existing(doc, progress_callback=None):
         actual_count = document_chunk_count(docid)
         if actual_count < expected_chunks:
             raise RuntimeError(f"ChromaDB has {actual_count} chunks; expected {expected_chunks}.")
+        document_profile = detect_document_type("\n".join(profile_sample), doc["filename"])
+        logger.info("Document type detected: id=%s type=%s confidence=%s", docid,
+                    document_profile["type"], document_profile["confidence"])
         db.update_document(
             docid, updated_at=now(), processing_status="indexed",
             extraction_status="complete", indexing_status="complete",
-            chunk_count=actual_count, source_metadata={"locations": source_metadata},
+            chunk_count=actual_count,
+            source_metadata={"locations": source_metadata,
+                             "document_type": document_profile["type"],
+                             "type_confidence": document_profile["confidence"],
+                             "type_signals": document_profile["signals"]},
             extracted_path=str(artifact_path), processing_error=None, last_reconciled_at=now()
         )
         logger.info("Document indexed: id=%s filename=%s chunks=%s extraction_seconds=%.2f chunking_seconds=%.2f total_seconds=%.2f", docid, doc["filename"], actual_count, extraction_seconds, chunking_seconds, time.perf_counter()-total_started)

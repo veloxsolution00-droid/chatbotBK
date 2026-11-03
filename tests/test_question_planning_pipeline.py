@@ -56,7 +56,7 @@ def test_chat_runs_each_decomposed_requirement(monkeypatch):
         {"document_id": "d1", "processing_status": "indexed", "indexing_status": "complete"}
     ])
     seen = []
-    def fake_answer_one(question, indexed, owner_id):
+    def fake_answer_one(question, indexed, owner_id, doc_types=None):
         seen.append(question)
         return {"question": question, "status": "success", "answer": f"Evidence found for {question} [1].",
                 "sources": [{"rank": 1, "filename": "policy.pdf", "source_location": "page 1", "supporting_text": question}],

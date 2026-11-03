@@ -1,8 +1,14 @@
 from pathlib import Path
-import json, csv, shutil, re, xml.etree.ElementTree as ET
+import json, csv, shutil, re, os, tempfile, xml.etree.ElementTree as ET
 from html.parser import HTMLParser
 SUPPORTED={".pdf",".docx",".txt",".md",".log",".html",".htm",".rtf",".odt",".jpg",".jpeg",".png",".tif",".tiff",".bmp",".webp",
            ".xlsx",".xlsm",".ods",".csv",".pptx",".json",".xml",".yaml",".yml",".eml"}
+
+# A page with fewer characters than this is probably a scan (or a page whose
+# text layer only covers a header), so OCR is worth attempting even if some text
+# was found. Previously OCR ran only when the page text was completely empty.
+_MIN_TEXT_LAYER_CHARS = 80
+_TABLE_NAME_HINT = re.compile(r"invoice|receipt|statement|bill|quote|purchase|order|ledger|table|report", re.I)
 
 class NoReadableTextError(ValueError):
     """The file was processed successfully but contains no indexable text."""
@@ -82,6 +88,113 @@ def _row_text(row):
     return " | ".join("" if value is None else str(value) for value in row)
 
 
+def _looks_tabular(text):
+    """Cheap pre-check so table probing is skipped on ordinary prose pages."""
+    lines = [line for line in (text or "").splitlines() if line.strip()]
+    if len(lines) < 3:
+        return False
+
+    def tabular_line(line):
+        if line.count(" | ") >= 2:
+            return True
+        # Count column gaps without consuming the following word, otherwise two
+        # adjacent matches overlap and a three-column row scores as one.
+        runs = len(re.findall(r"\S\s{2,}(?=\S)", line))
+        if runs >= 2:
+            return True
+        # Short aligned rows ("Total    120.00") still count; long prose lines
+        # with a double space after a full stop do not.
+        return runs >= 1 and len(line.split()) <= 8
+
+    spaced = sum(1 for line in lines if tabular_line(line))
+    return spaced / len(lines) >= 0.25
+
+
+def _clean_cell(value):
+    """Collapse a cell's internal line breaks without inserting stray spaces."""
+    parts = [part.strip() for part in str(value or "").replace("\r", "").splitlines() if part.strip()]
+    cleaned = ""
+    for part in parts:
+        if cleaned and re.fullmatch(r"[.,;:%)]+", part):
+            cleaned += part
+        elif cleaned:
+            cleaned += " " + part
+        else:
+            cleaned = part
+    return re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+
+
+def _table_blocks(rows, label, rows_per_block):
+    """Yield table rows with the header repeated, preserving column structure."""
+    cleaned = [[_clean_cell(cell) for cell in row] for row in rows]
+    cleaned = [row for row in cleaned if any(row)]
+    if not cleaned:
+        return
+    # Bordered-table detection can invent empty columns where a text span sits
+    # next to a rule. Drop columns that are empty in every row; no data is lost.
+    width = max(len(row) for row in cleaned)
+    cleaned = [row + [""] * (width - len(row)) for row in cleaned]
+    keep = [index for index in range(width) if any(row[index] for row in cleaned)]
+    if keep:
+        cleaned = [[row[index] for index in keep] for row in cleaned]
+    header, body = cleaned[0], cleaned[1:]
+    if not body:
+        yield (label, f"{label}\n{_row_text(header)}")
+        return
+    batch_size = max(1, int(rows_per_block or 1))
+    for start in range(0, len(body), batch_size):
+        batch = body[start:start + batch_size]
+        lines = [f"Row {start + index + 1}: {_row_text(row)}"
+                 for index, row in enumerate(batch)]
+        yield (label, f"{label}\nColumns: {_row_text(header)}\n" + "\n".join(lines))
+
+
+def _text_outside_tables(page, table_rects):
+    """Read page text but skip blocks that belong to an extracted table.
+
+    Without this the table text would be indexed twice: once flattened by
+    `get_text()` and once as structured rows. The flattened copy is exactly the
+    view that loses column meaning, so it is the copy to drop.
+    """
+    if not table_rects:
+        return page.get_text().strip()
+    try:
+        import pymupdf
+        Rect = pymupdf.Rect
+    except ImportError:
+        from fitz import Rect
+    parts = []
+    for block in page.get_text("blocks"):
+        if len(block) < 7 or block[6] != 0:
+            continue
+        rect = Rect(block[0], block[1], block[2], block[3])
+        if any(rect.intersects(table_rect) for table_rect in table_rects):
+            continue
+        text = str(block[4]).strip()
+        if text:
+            parts.append(text)
+    return "\n".join(parts).strip()
+
+
+def _ocr_image(pytess, image):
+    """OCR one image with block segmentation, which handles tables far better."""
+    from PIL import ImageOps
+    try:
+        return pytess.image_to_string(ImageOps.grayscale(image), config="--psm 6").strip()
+    except Exception:
+        return ""
+
+
+def _ocr_pdf_page(pytess, page):
+    from PIL import Image
+    from io import BytesIO
+    try:
+        pixmap = page.get_pixmap(dpi=300)
+        return _ocr_image(pytess, Image.open(BytesIO(pixmap.tobytes("png"))))
+    except Exception:
+        return ""
+
+
 def _csv_blocks(path, rows_per_block):
     with open(path, encoding=_text_encoding(path), errors="replace", newline="") as f:
         reader = csv.reader(f)
@@ -146,25 +259,76 @@ def iter_extract(path):
         with pymupdf.open(path) as pdf:
             if pdf.page_count > settings.max_pdf_pages:
                 raise ValueError(f"PDF has {pdf.page_count} pages, above the configured MAX_PDF_PAGES limit of {settings.max_pdf_pages}.")
+            probe_tables = bool(_TABLE_NAME_HINT.search(Path(path).name))
+            pytess = None
             for i,p in enumerate(pdf,1):
-                text=p.get_text().strip()
-                if not text:
-                    pytess = _get_tesseract()
+                raw_text = p.get_text().strip()
+                # Bordered tables often have almost no plain text between cells;
+                # column-aligned invoices show repeated whitespace runs instead.
+                tables = []
+                if probe_tables or _looks_tabular(raw_text):
+                    try:
+                        tables = list(p.find_tables().tables)
+                    except Exception:
+                        tables = []
+                table_rects = []
+                for table in tables:
+                    try:
+                        table_rects.append(pymupdf.Rect(table.bbox))
+                    except Exception:
+                        continue
+                text = _text_outside_tables(p, table_rects).strip()
+                if len(raw_text) < _MIN_TEXT_LAYER_CHARS:
+                    # A short text layer usually means a scan or a header-only
+                    # page. OCR the rendered page and keep it when it is richer.
+                    if pytess is None:
+                        pytess = _get_tesseract()
                     if pytess:
-                        try:
-                            from PIL import Image
-                            from io import BytesIO
-                            text=pytess.image_to_string(Image.open(BytesIO(p.get_pixmap().tobytes("png")))).strip()
-                        except Exception:
-                            pass
+                        ocr_text = _ocr_pdf_page(pytess, p)
+                        if len(ocr_text) > len(text):
+                            text = ocr_text
                 if text:
-                    yielded = True; yield (f"page {i}",text)
+                    yielded = True; yield (f"page {i}", text)
+                for table_number, table in enumerate(tables, 1):
+                    try:
+                        rows = table.extract()
+                    except Exception:
+                        continue
+                    for loc, body in _table_blocks(
+                            rows, f"Table {table_number} — page {i}",
+                            settings.extraction_block_rows):
+                        yielded = True; yield (loc, body)
     elif ext==".docx":
         from docx import Document
-        d=Document(path); text="\n".join(p.text for p in d.paragraphs if p.text.strip())
-        for ti,t in enumerate(d.tables,1):
-            text += "\n" + "\n".join(f"[Table {ti}] "+" | ".join(c.text for c in row.cells) for row in t.rows)
-        if text.strip(): yielded = True; yield ("document",text)
+        from docx.table import Table
+        from docx.text.paragraph import Paragraph
+        document = Document(path)
+        # Walk the body in document order so a table stays next to the heading
+        # that introduces it. The old version appended every table at the end.
+        buffer, part, table_number = [], 1, 0
+        for child in document.element.body.iterchildren():
+            tag = child.tag.rsplit("}", 1)[-1]
+            if tag == "p":
+                text = Paragraph(child, document).text.strip()
+                if text:
+                    buffer.append(text)
+            elif tag == "tbl":
+                if buffer:
+                    loc = "document" if part == 1 else f"document part {part}"
+                    yielded = True; yield (loc, "\n".join(buffer))
+                    buffer, part = [], part + 1
+                table_number += 1
+                try:
+                    rows = [[cell.text.strip() for cell in row.cells]
+                            for row in Table(child, document).rows]
+                except Exception:
+                    continue
+                for loc, body in _table_blocks(rows, f"Table {table_number}",
+                                               settings.extraction_block_rows):
+                    yielded = True; yield (loc, body)
+        if buffer:
+            loc = "document" if part == 1 else f"document part {part}"
+            yielded = True; yield (loc, "\n".join(buffer))
     elif ext in {".jpg",".jpeg",".png",".tif",".tiff",".bmp",".webp"}:
         pytess = _get_tesseract()
         if not pytess:
@@ -172,12 +336,20 @@ def iter_extract(path):
                 f"Tesseract OCR is not installed or configured. Cannot extract text from '{Path(path).name}'. "
                 f"Install Tesseract OCR or set TESSERACT_CMD in .env to the tesseract.exe path."
             )
-        from PIL import Image, ImageOps
+        from PIL import Image, ImageSequence
         with Image.open(path) as image:
-            if image.width * image.height > settings.max_image_pixels:
-                raise ValueError(f"Image has {image.width * image.height:,} pixels, above the configured MAX_IMAGE_PIXELS limit of {settings.max_image_pixels:,}.")
-            text = pytess.image_to_string(ImageOps.grayscale(image)).strip()
-        if text: yielded = True; yield ("image", text)
+            # Multi-page TIFFs are common for scanned invoices. The old code read
+            # only the first frame, silently dropping every later page.
+            frame_count = getattr(image, "n_frames", 1)
+            if frame_count > settings.max_pdf_pages:
+                raise ValueError(f"Image has {frame_count} frames, above the configured MAX_PDF_PAGES limit of {settings.max_pdf_pages}.")
+            for index, frame in enumerate(ImageSequence.Iterator(image), 1):
+                if frame.width * frame.height > settings.max_image_pixels:
+                    raise ValueError(f"Image frame has {frame.width * frame.height:,} pixels, above the configured MAX_IMAGE_PIXELS limit of {settings.max_image_pixels:,}.")
+                text = _ocr_image(pytess, frame)
+                if text:
+                    yielded = True
+                    yield (f"image frame {index}" if frame_count > 1 else "image", text)
     elif ext in {".txt", ".md", ".log", ".html", ".htm", ".yaml", ".yml", ".rtf"}:
         text=Path(path).read_text(encoding=_text_encoding(path),errors="replace")
         if ext in {".html", ".htm"}:
@@ -211,8 +383,39 @@ def iter_extract(path):
         content = body.get_content() if body else ""
         if body is not None and body.get_content_type() == "text/html":
             content = _html_to_text(content)
-        text = f"Subject: {m.get('subject','')}\nFrom: {m.get('from','')}\n"+content
+        header = (f"Subject: {m.get('subject','')}\nFrom: {m.get('from','')}\n"
+                  f"To: {m.get('to','')}\nDate: {m.get('date','')}\n")
+        text = header + content
         if text.strip(): yielded = True; yield ("email", text)
+        # Invoices and contracts usually arrive as attachments, not as the email
+        # body. Extract supported attachments under the same size limits.
+        for attachment in m.iter_attachments():
+            filename = attachment.get_filename() or "attachment"
+            suffix = Path(filename).suffix.lower()
+            if suffix not in SUPPORTED or suffix == ".eml":
+                continue
+            try:
+                data = attachment.get_payload(decode=True) or b""
+            except Exception:
+                continue
+            if not data or len(data) > settings.max_file_mb * 1024 * 1024:
+                continue
+            temp = None
+            try:
+                temp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+                temp.write(data); temp.close()
+                for loc, block in iter_extract(temp.name):
+                    yielded = True
+                    yield (f"email attachment: {filename} / {loc}", block)
+            except Exception:
+                # A single unreadable attachment must not discard the email body.
+                continue
+            finally:
+                if temp is not None:
+                    try:
+                        os.unlink(temp.name)
+                    except OSError:
+                        pass
     elif ext==".odt":
         import zipfile
         with zipfile.ZipFile(path) as z: xml=z.read("content.xml")

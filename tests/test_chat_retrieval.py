@@ -189,7 +189,7 @@ def test_multi_question_citations_are_remapped_to_combined_source_list(monkeypat
         {"document_id": "d1", "processing_status": "indexed", "indexing_status": "complete"},
         {"document_id": "d2", "processing_status": "indexed", "indexing_status": "complete"},
     ])
-    def fake_answer_one(question, indexed, owner_id):
+    def fake_answer_one(question, indexed, owner_id, doc_types=None):
         if "date" in question:
             return {"question": question, "status": "success", "answer": "Date is 2025 [1].", "abstained": False,
                     "sources": [{"rank": 1, "filename": "a.pdf", "source_location": "page 1", "supporting_text": "Date 2025"}]}

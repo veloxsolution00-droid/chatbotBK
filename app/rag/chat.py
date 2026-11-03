@@ -23,6 +23,20 @@ from app.rag.prompts import answer_instructions
 logger = logging.getLogger(__name__)
 ABSTENTION = "No relevant information was found in the uploaded documents."
 
+# Type-specific instructions. They are deliberately short: a phrase that sounds
+# like an extra constraint can flip a 3B model into a refusal (observed with
+# "use at most three sentences").
+_TYPE_GUIDANCE = {
+    "invoice": "This is an invoice or receipt. Copy exact values, currency and dates from the evidence; "
+               "never round or recompute a total unless the question asks you to.",
+    "legal": "This is a legal document. Quote the governing clause in the evidence, then state it in one "
+             "sentence. Cite the clause number or page. If a term is absent, say it is absent; never infer it.",
+    "question_bank": "This document contains questions, not answers. If the evidence is only questions, "
+                     "list the relevant questions and state that the document does not provide the answers.",
+    "spreadsheet": "This is a spreadsheet. Read values from the labelled rows and columns and keep the "
+                   "exact numbers and units.",
+}
+
 # Phrases that indicate the model could not ground an answer. Small local models
 # refuse far less reliably when the prompt hands them a literal refusal string to
 # copy, so the prompts below do not dictate one; refusal is detected here instead.
@@ -208,7 +222,63 @@ def _direct_calculation_result(question, direct_result):
     return {"question": question, "status": "success",
             "answer": f"Calculation: {direct_result['expression']} = {display}",
             "sources": [], "abstained": False, "question_type": "calculation",
+            "confidence": {"score": 1.0, "label": "high"},
             "calculation": {**direct_result, "result": value}}
+
+
+def _confidence_score(result):
+    """Blend observable signals into one calibrated number.
+
+    The status field only says whether an answer was produced; this says how
+    much the evidence and the checks actually support it.
+    """
+    if result.get("abstained"):
+        return {"score": 0.0, "label": "none"}
+    retrieval = result.get("retrieval") or {}
+    citation = result.get("citation_validation") or {}
+    verification = result.get("verification") or {}
+    similarity = float(retrieval.get("best_similarity") or 0)
+    coverage = float(retrieval.get("evidence_term_coverage") or 0)
+    citation_coverage = float(citation.get("citation_coverage") or 0)
+    score = 0.40 * min(similarity / 0.75, 1.0) + 0.20 * min(coverage, 1.0)
+    if citation.get("valid"):
+        score += 0.15
+    if verification.get("passed"):
+        score += 0.15
+    # Citation coverage is what separates "one citation somewhere" from "every
+    # factual sentence is grounded". It moves the score without vetoing an answer.
+    score += 0.10 * min(citation_coverage, 1.0)
+    score = round(min(1.0, max(0.0, score)), 3)
+    label = "high" if score >= 0.75 else "medium" if score >= 0.5 else "low"
+    return {"score": score, "label": label,
+            "signals": {"retrieval_similarity": round(similarity, 3),
+                        "term_coverage": round(coverage, 3),
+                        "citation_valid": bool(citation.get("valid")),
+                        "citation_coverage": round(citation_coverage, 3),
+                        "verified": verification.get("passed")}}
+
+
+def _aggregate_citation_validation(answers):
+    validations = [a.get("citation_validation") for a in answers if a.get("citation_validation")]
+    if not validations:
+        return None
+    return {
+        "valid": all(bool(v.get("valid")) for v in validations),
+        "answers_checked": len(validations),
+        "invalid_reference_numbers": sorted(
+            {n for v in validations for n in (v.get("invalid_reference_numbers") or [])}),
+        "phantom_labels": sorted(
+            {s for v in validations for s in (v.get("phantom_labels") or [])}),
+        "citation_coverage": round(
+            sum(float(v.get("citation_coverage") or 0) for v in validations) / len(validations), 3),
+    }
+
+
+def _aggregate_confidence(answers):
+    scores = [_confidence_score(item)["score"] for item in answers]
+    score = round(sum(scores) / len(scores), 3) if scores else 0.0
+    label = "high" if score >= 0.75 else "medium" if score >= 0.5 else "low" if score > 0 else "none"
+    return {"score": score, "label": label}
 
 def _verify_answer(question, evidence, draft):
     """Return whether the draft is wholly supported by the retrieved evidence.
@@ -235,23 +305,25 @@ def _verify_answer(question, evidence, draft):
         if focused:
             evidence = "\n\n".join(focused)
     verdict_prompt = (
-        "Decide if the DRAFT ANSWER is supported by the EVIDENCE. The draft is SUPPORTED when each of its "
-        "sentences restates or summarises facts that appear in the EVIDENCE; rephrasing and combining "
-        "several evidence sentences is allowed.\n"
-        "Example: EVIDENCE says 'Within our control are opinion, aim, desire.' DRAFT says 'Opinion is "
-        "within our control.' -> SUPPORTED\n"
-        "Example: EVIDENCE never mentions Rome. DRAFT says 'He wrote this in Rome.' -> UNSUPPORTED\n"
-        "Reply with exactly one word: SUPPORTED or UNSUPPORTED.\n"
+        "Decide two things about the DRAFT ANSWER.\n"
+        "1. Support: is each sentence supported by the EVIDENCE? Rephrasing and combining evidence "
+        "sentences is allowed.\n"
+        "2. Relevance: does the draft answer the QUESTION that was asked, rather than a related topic?\n"
+        "Example: EVIDENCE 'Within our control are opinion, aim, desire.' DRAFT 'Opinion is within our "
+        "control.' -> SUPPORTED ANSWERED\n"
+        "Example: EVIDENCE never mentions Rome. DRAFT 'He wrote this in Rome.' -> UNSUPPORTED ANSWERED\n"
+        "Example: QUESTION 'Who is Dracula?' DRAFT 'Dracula is a novel by Bram Stoker.' -> SUPPORTED NOT ANSWERED\n"
+        "Reply with exactly two words, for example: SUPPORTED ANSWERED\n"
         f"QUESTION: {question}\nEVIDENCE:\n{evidence}\nDRAFT ANSWER:\n{draft}"
     )
     verdict = generate(verdict_prompt, num_predict=settings.verify_max_tokens).strip().upper()
-    # Small local models rarely reply with the exact single word; they wrap it in
-    # punctuation or a short sentence ("SUPPORTED.", "Yes, supported"). Parse the
-    # label instead of demanding an exact match, but still require an explicit
-    # affirmation and treat an empty/ambiguous reply as unsupported.
+    # Small local models rarely reply with the exact label set; parse the labels
+    # instead of demanding an exact match, and treat an ambiguous reply as a fail.
     if "UNSUPPORTED" in verdict or "NOT SUPPORTED" in verdict or "NOT SUFFICIENT" in verdict:
         return False
-    return "SUPPORTED" in verdict
+    if "NOT ANSWERED" in verdict or "UNANSWERED" in verdict or "DOES NOT ANSWER" in verdict:
+        return False
+    return "SUPPORTED" in verdict and "ANSWERED" in verdict
 
 def _retrieval_cache_config():
     return cache_manager.config_fingerprint("retrieval", {
@@ -277,7 +349,8 @@ def _answer_cache_config():
     })
 
 
-def _answer_one(question, indexed, owner_id):
+def _answer_one(question, indexed, owner_id, doc_types=None):
+    doc_types = doc_types or {}
     normalized = normalize_question(question)
     task_type = classify_question(normalized)
     # Explicit arithmetic supplied by the user can be evaluated deterministically;
@@ -457,9 +530,20 @@ def _answer_one(question, indexed, owner_id):
 
     if not hits:
         return {"question": question, "status": "insufficient_evidence", "answer": ABSTENTION, "sources": [], "abstained": True, "retrieval": retrieval}
+    # The document type was detected during ingestion. Use it to steer the answer
+    # shape (exact invoice values, verbatim clauses, question-bank disclosure).
+    type_counts = {}
+    for hit in hits:
+        dtype = doc_types.get((hit.get("metadata") or {}).get("document_id"))
+        if dtype:
+            type_counts[dtype] = type_counts.get(dtype, 0) + 1
+    doc_type = max(type_counts, key=type_counts.get) if type_counts else None
+    if type_counts:
+        retrieval["document_types"] = sorted(type_counts)
     evidence = "\n\n".join(f"[{i}] {(hit.get('metadata') or {}).get('filename')} ({(hit.get('metadata') or {}).get('source_location')}):\n{hit.get('text', '')}" for i, hit in enumerate(hits, 1))
     task_type = classify_question(normalized)
     guidance = answer_instructions(task_type)
+    type_guidance = _TYPE_GUIDANCE.get(doc_type, "")
     if task_type == "calculation":
         plan_prompt = (
             "You are a calculation planner for a document-grounded system. Return ONLY a JSON object with keys "
@@ -502,11 +586,17 @@ def _answer_one(question, indexed, owner_id):
         "symbolism, or conclusions of your own.\n"
         "5. Use the words the EVIDENCE uses. Do not copy a term from the QUESTION that the evidence "
         "never mentions.\n"
-        "6. Answer the question and stop; use at most three sentences and do not pad the answer.\n"
+        "6. Answer the question and stop; do not pad the answer.\n"
         "7. End EVERY sentence with the evidence number(s) in square brackets that support it, and "
         "never write a sentence without one. If sources disagree, cite both.\n"
+        "8. Answer the QUESTION that was asked. If it asks who or what a named thing is, state its "
+        "role or identity; do not describe the book, chapter or section it appears in.\n"
+        "9. Never restate the question as the answer. If your draft only repeats the question's words, "
+        "say you cannot find the answer.\n"
         f"{guidance}\n"
+        f"{type_guidance}\n"
         "Good style: The schooner was Russian and called the Demeter [1]. It ran aground at Whitby in a storm [2].\n"
+        "Good style (who is X): Mina Murray is Jonathan Harker's fiancée [3].\n"
         "Bad style (never do this): The Demeter [1] symbolises the decline of empire, a theme that haunts the novel.\n"
         f"QUESTION TYPE: {task_type}\nQUESTION: {normalized}\n{conflict_note}EVIDENCE:\n{evidence}\n"
         "Now write the answer; every sentence must end with its supporting [n].\nANSWER:"
@@ -592,13 +682,18 @@ def _answer_one(question, indexed, owner_id):
                     "sources": source_records, "abstained": False, "retrieval": retrieval,
                     "citation_validation": citation_validation, "question_type": task_type,
                     "verification": verification, "potential_conflicts": potential_conflicts}
+    final_result["confidence"] = _confidence_score(final_result)
     
     cache_manager.put_result("answer", normalized, owner_id, corpus_version, answer_config,
                              final_result, query_vector=query_vector, question_type=task_type)
     return final_result
 
 def answer(question, owner_id="local", history=None):
-    indexed = {doc["document_id"] for doc in list_docs(owner_id) if doc.get("processing_status") == "indexed" and doc.get("indexing_status") == "complete"}
+    documents = list_docs(owner_id)
+    indexed = {doc["document_id"] for doc in documents
+               if doc.get("processing_status") == "indexed" and doc.get("indexing_status") == "complete"}
+    doc_types = {doc["document_id"]: (doc.get("source_metadata") or {}).get("document_type")
+                 for doc in documents}
     if not indexed:
         # Deterministic arithmetic does not depend on documents. Previously this
         # gate rejected "What is 10% of 250?" with "no searchable documents".
@@ -612,7 +707,7 @@ def answer(question, owner_id="local", history=None):
                                    "selected_chunks": 0, "best_similarity": None,
                                    "top_k": settings.top_k, "min_similarity": settings.min_similarity}
             return result
-        return {"status": "insufficient_evidence", "answer": "No searchable documents are ready yet. Check the ingestion job status; the document must finish embedding and indexing first.", "sources": [], "abstained": True, "retrieval": {"indexed_documents": 0, "candidate_chunks": 0, "selected_chunks": 0, "top_k": settings.top_k, "min_similarity": settings.min_similarity}}
+        return {"status": "insufficient_evidence", "answer": "No searchable documents are ready yet. Check the ingestion job status; the document must finish embedding and indexing first.", "sources": [], "abstained": True, "confidence": {"score": 0.0, "label": "none"}, "retrieval": {"indexed_documents": 0, "candidate_chunks": 0, "selected_chunks": 0, "top_k": settings.top_k, "min_similarity": settings.min_similarity}}
     resolved_question = _resolve_followup(question, history) if _clean_history(history) else question
     questions = split_questions(resolved_question)
     question_plan = plan_question(resolved_question, max_parts=settings.max_question_parts)
@@ -621,13 +716,14 @@ def answer(question, owner_id="local", history=None):
     if len(questions) == 1 and question_plan["decomposed"]:
         questions = question_plan["subquestions"]
     answer_plan = build_answer_plan(questions)
-    answers = [_answer_one(item, indexed, owner_id) for item in questions]
+    answers = [_answer_one(item, indexed, owner_id, doc_types) for item in questions]
     if len(answers) == 1:
         result = answers[0]
         result["question_resolved"] = resolved_question if resolved_question != question else None
         result["question_type"] = classify_question(questions[0])
         result["question_plan"] = question_plan
         result["coverage"] = coverage_summary(answers)
+        result.setdefault("confidence", _confidence_score(result))
         return result
     sources, source_indexes = [], {}
     rendered_answers = []
@@ -658,4 +754,4 @@ def answer(question, owner_id="local", history=None):
         combined_status = "citation_validation_failed"
     else:
         combined_status = "insufficient_evidence"
-    return {"status": combined_status, "answer": combined, "answers": answers, "sources": sources, "abstained": all(item["abstained"] for item in answers), "retrieval": {"questions": len(answers), "indexed_documents": len(indexed)}, "question_type": "multi_question", "question_resolved": resolved_question if resolved_question != question else None, "question_plan": question_plan, "answer_plan": answer_plan, "coverage": coverage}
+    return {"status": combined_status, "answer": combined, "answers": answers, "sources": sources, "abstained": all(item["abstained"] for item in answers), "retrieval": {"questions": len(answers), "indexed_documents": len(indexed)}, "question_type": "multi_question", "question_resolved": resolved_question if resolved_question != question else None, "question_plan": question_plan, "answer_plan": answer_plan, "coverage": coverage, "citation_validation": _aggregate_citation_validation(answers), "confidence": _aggregate_confidence(answers)}

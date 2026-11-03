@@ -7,9 +7,14 @@ _STOP = {"the", "and", "for", "with", "what", "when", "where", "which", "who", "
 def select_evidence(requirement: str, hits: list[dict], max_chunks: int = 5, max_chars: int = 9000) -> dict:
     terms = {t.lower() for t in re.findall(r"[\w-]+", requirement) if len(t) > 2 and t.lower() not in _STOP}
     selected, seen, chars = [], set(), 0
+    # A bare heading or a one-line snippet cannot support an answer, but it can
+    # take a top_k slot. Skip such chunks whenever a substantial one exists.
+    has_substantial = any(len((hit.get("text") or "").strip()) >= 150 for hit in hits)
     for hit in hits:
         key = hit.get("id") or (hit.get("metadata", {}).get("document_id"), hit.get("text"))
         if key in seen:
+            continue
+        if has_substantial and len((hit.get("text") or "").strip()) < 150:
             continue
         if selected and chars + len(hit.get("text", "")) > max_chars:
             continue
