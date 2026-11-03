@@ -39,8 +39,17 @@ def _fts_query(question_terms):
 def collection():
     global _client, _collection
     if _collection is None:
+        # Imported lazily so a minimal test double for the top-level chromadb
+        # module (used by unit tests) does not need to provide submodules.
+        from chromadb.config import Settings as ChromaSettings
         Path(settings.chroma_path).mkdir(parents=True, exist_ok=True)
-        _client = chromadb.PersistentClient(path=str(settings.chroma_path))
+        # Telemetry is disabled explicitly: this application is local-only and
+        # the bundled telemetry client raises noisy errors on some Windows
+        # installs. Disabling it also avoids any outbound analytics attempt.
+        _client = chromadb.PersistentClient(
+            path=str(settings.chroma_path),
+            settings=ChromaSettings(anonymized_telemetry=False),
+        )
         # Never delete or recreate an existing collection at startup.
         _collection = _client.get_or_create_collection(
             name=settings.collection_name,
@@ -112,8 +121,11 @@ def search(question, owner_id="local"):
         seen_chunk_ids.add(chunk_id)
 
     # FTS brings in exact hits that semantic retrieval may not rank highly,
-    # particularly identifiers, dates, codes, and values from tables.
-    lexical_limit = max(candidate_count, int(settings.lexical_candidate_limit))
+    # particularly identifiers, dates, codes, and values from tables. The
+    # configured lexical limit is a hard cap: using max(candidate_count, limit)
+    # silently ignored LEXICAL_CANDIDATE_LIMIT whenever it was below the dense
+    # candidate count.
+    lexical_limit = max(1, int(settings.lexical_candidate_limit))
     for fts_hit in db.search_indexed_chunks(_fts_query(question_terms), owner_id, lexical_limit):
         if fts_hit["chunk_id"] in seen_chunk_ids:
             continue

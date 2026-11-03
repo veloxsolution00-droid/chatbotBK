@@ -15,8 +15,10 @@ def citation_line(sources):
 
 with st.sidebar:
     st.subheader("System status")
+    health_limits = {}
     try:
         h = requests.get(API + "/health", timeout=5).json()
+        health_limits = h.get("limits") or {}
         st.write("Backend:", h.get("status"))
         ollama = h.get("ollama", {})
         st.write("Ollama:", "Connected" if ollama.get("available") else "Unavailable")
@@ -27,17 +29,21 @@ with st.sidebar:
     except Exception as e: st.warning(f"Backend not reachable. Start FastAPI first. {e}")
 
     st.subheader("Upload documents")
-    up = st.file_uploader("Select multiple documents", accept_multiple_files=True, key="uploads")
+    if "uploader_id" not in st.session_state:
+        st.session_state.uploader_id = 0
+    up = st.file_uploader("Select multiple documents", accept_multiple_files=True, key=f"uploader_{st.session_state.uploader_id}")
     if st.button("Upload and process", disabled=not up, use_container_width=True):
         try:
             total = sum(f.size for f in up)
-            if total > 500 * 1024 * 1024: st.error("Batch exceeds 500 MB.")
+            max_batch_mb = int(health_limits.get("max_batch_mb", 500) or 500)
+            if total > max_batch_mb * 1024 * 1024: st.error(f"Batch exceeds {max_batch_mb} MB.")
             else:
                 files = [("files", (f.name, f.getvalue(), f.type or "application/octet-stream")) for f in up]
                 with st.spinner("Saving files and adding ingestion jobs to the local queue..."):
                     data = api_post("/documents/upload", files=files, timeout=600)
                 st.success(f"Accepted {data['files']} file(s), {data['total_bytes'] / (1024*1024):.1f} MB. Staging: {data['staging_seconds']} sec.")
                 st.info("The job list updates automatically with the current extraction, chunking, embedding, and indexing stage.")
+                st.session_state.uploader_id += 1
                 st.rerun()
         except Exception as e: st.error(f"Upload failed: {e}")
 
@@ -94,7 +100,9 @@ if q:
     with st.chat_message("assistant"):
         try:
             with st.spinner("Resolving context, retrieving supporting passages, and generating a local answer..."):
-                history = [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages[:-1][-8:] if m.get("role") in ("user", "assistant")]
+                # The API caps each history message at 2000 characters. Answers can
+                # be longer, so trim here instead of failing the next request with 422.
+                history = [{"role": m["role"], "content": str(m["content"])[:2000]} for m in st.session_state.messages[:-1][-8:] if m.get("role") in ("user", "assistant")]
                 data = api_post("/chat", json={"question":q, "history":history}, timeout=600)
             st.markdown(data.get("answer", "No answer returned."))
             retrieval = data.get("retrieval", {})
@@ -108,6 +116,9 @@ if q:
             citation_check = data.get("citation_validation")
             if citation_check and not citation_check.get("valid", False):
                 st.warning("Citation validation did not pass. The response may have been withheld because its source reference was missing or invalid.")
+            verification = data.get("verification") or {}
+            if verification.get("checked") and not verification.get("passed"):
+                st.warning("The local verifier could not confirm this answer against the cited passages. Treat it as unverified and check the sources below.")
             conflicts = data.get("potential_conflicts") or []
             if conflicts:
                 st.warning(f"Potential evidence disagreement detected in {len(conflicts)} passage pair(s). Review the cited passages; this is a heuristic warning, not a confirmed contradiction.")

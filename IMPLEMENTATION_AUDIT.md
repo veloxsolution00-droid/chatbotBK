@@ -22,14 +22,25 @@
 ## Verification
 
 - `python -m compileall -q app tests evaluation`: passed.
-- `python -m pytest -q -rs`: **67 passed, 1 skipped**.
+- `python -m pytest -q -rs`: **87 passed, 0 skipped** (Python 3.11.9; also 87 passed from `.venv\Scripts\python.exe`).
+- Live runtime checks passed: FastAPI lifespan startup/reconciliation, `/health`, `/documents`, `/jobs`, `/chat`, and a real `uvicorn` + Streamlit launch on loopback. The existing corpus had 5 indexed PDFs, 1,785 ChromaDB chunks, and a matching 1,785-row FTS index.
 - Chat API request schema smoke test passed with a lightweight ChromaDB import stub.
+
+## Post-review fixes
+
+- Multi-question citations of the form `[1, 2]` are remapped to the combined source list.
+- `LEXICAL_CANDIDATE_LIMIT` is enforced as a real cap; ChromaDB telemetry is disabled for this local-only app.
+- FTS `owner_id` rows are migrated with the rest of a legacy install; retry submission and job claiming are atomic so a job cannot be processed twice.
+- Direct arithmetic is allowed with no indexed documents, but year ranges and identifiers (for example `2024-2025`) are no longer evaluated as subtraction.
+- Statements after a question mark remain part of that question instead of becoming extra sub-answers.
+- Extraction handles HTML as visible text, cp1252/latin-1 text, BOM-prefixed JSON, and both PyMuPDF module names.
+- Relative storage overrides are anchored to the project root; `/health` reports degraded (and returns 200) when metadata is unavailable instead of raising.
+- Streamlit reads the batch limit from `/health` and truncates history to the API's 2,000-character limit.
 
 ## Limits requiring real-machine validation
 
-- This environment does not have the ChromaDB package installed, so live ChromaDB operations were not exercised here.
-- No live Ollama model call, real document upload/indexing, OCR validation, or performance test was run.
-- The single skipped test remains skipped; inspect its condition in the test suite before deployment.
+- ChromaDB, Ollama generation/embedding models, document indexing, and a loopback FastAPI + Streamlit launch were exercised on this machine. OCR was not validated because no image-only/OCR fixture was available.
+- Operation with the network fully disabled (firewall-level) was not tested; all configured endpoints are loopback-only.
 - Structure-aware chunking is not embedding-based semantic segmentation; ranking is not a calibrated confidence model.
 - Scenario reasoning is not a formal policy engine. LLM-based formula selection can still be wrong even when numeric operands and arithmetic syntax validate.
 - Citation checks prove reference bounds, not semantic entailment. Model verification is not independent proof.

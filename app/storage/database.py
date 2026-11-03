@@ -257,6 +257,15 @@ def migrate_to_local_owner():
     with transaction() as conn:
         conn.execute("UPDATE documents SET owner_id='local' WHERE owner_id IS NULL OR owner_id!='local'")
         conn.execute("UPDATE ingestion_jobs SET owner_id='local' WHERE owner_id IS NULL OR owner_id!='local'")
+        # The FTS index stores owner_id in its own table, so it must be migrated
+        # alongside the Chroma metadata. Otherwise upgraded installs keep a
+        # keyword index scoped to an owner that no longer exists, and exact-term
+        # retrieval silently returns nothing.
+        try:
+            conn.execute("UPDATE chunk_search SET owner_id='local' WHERE owner_id IS NULL OR owner_id!='local'")
+        except sqlite3.OperationalError as exc:
+            if "chunk_search" not in str(exc) and "fts5" not in str(exc).lower():
+                raise
         # Login was explicitly removed from this local-only build. Drop its old
         # credential/session tables; document, job, extraction, and vector data remain.
         conn.execute("DROP TABLE IF EXISTS sessions")
@@ -265,6 +274,55 @@ def migrate_to_local_owner():
 def recoverable_jobs():
     with connect() as conn:
         return [dict(r) for r in conn.execute("SELECT * FROM ingestion_jobs WHERE status IN ('queued','processing') ORDER BY created_at").fetchall()]
+
+
+def claim_job(job_id):
+    """Atomically move one queued/failed job to processing.
+
+    Returns True only for the caller that won the transition. This prevents two
+    submissions of the same job (for example a double-clicked retry, or a
+    startup recovery racing an upload) from extracting and indexing the same
+    document concurrently.
+    """
+    with transaction() as conn:
+        cursor = conn.execute(
+            "UPDATE ingestion_jobs SET status='processing' WHERE job_id=? AND status IN ('queued','failed')",
+            (job_id,),
+        )
+        return cursor.rowcount == 1
+
+
+def reset_processing_jobs():
+    """Requeue jobs left in processing by a previous process.
+
+    Called once when the worker pool is created. Without this, a crash during
+    ingestion would leave a job stuck at 'processing' forever.
+    """
+    from datetime import datetime, timezone
+    with transaction() as conn:
+        conn.execute(
+            "UPDATE ingestion_jobs SET status='queued', stage='Resuming after restart', updated_at=? "
+            "WHERE status='processing'",
+            (datetime.now(timezone.utc).isoformat(),),
+        )
+
+
+def requeue_failed_job(job_id):
+    """Atomically move a failed job back to queued.
+
+    The endpoint previously read the status, updated it, and submitted the job
+    in separate steps. Two nearly simultaneous retry requests could both pass
+    the check, and the second write could undo the first worker's claim and let
+    the same file be processed twice.
+    """
+    from datetime import datetime, timezone
+    with transaction() as conn:
+        cursor = conn.execute(
+            "UPDATE ingestion_jobs SET status='queued', stage='Queued for retry', progress=0, "
+            "updated_at=?, error=NULL WHERE job_id=? AND status='failed'",
+            (datetime.now(timezone.utc).isoformat(), job_id),
+        )
+        return cursor.rowcount == 1
 
 
 def index_chunks(records):

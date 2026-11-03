@@ -1,4 +1,5 @@
-import logging, time, uuid
+import logging, threading, time, uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -19,7 +20,6 @@ from logging.handlers import RotatingFileHandler
 _handler = RotatingFileHandler(Path(settings.logs_path) / "application.log", maxBytes=5*1024*1024, backupCount=5, encoding="utf-8")
 logging.basicConfig(level=logging.INFO, handlers=[_handler, logging.StreamHandler()], format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger(__name__)
-app = FastAPI(title="Offline Document Intelligence Chatbot", version="0.5.0-local")
 
 class ChatMessage(BaseModel):
     role: str = Field(pattern="^(user|assistant)$")
@@ -29,7 +29,21 @@ class ChatRequest(BaseModel):
     question: str = Field(min_length=1, max_length=5000)
     history: list[ChatMessage] = Field(default_factory=list, max_length=8)
 
-@app.on_event("startup")
+def _warm_models():
+    """Load both Ollama models before the first chat request.
+
+    Without this the first question pays model load on top of generation.
+    Failures are non-fatal; /health still reports real Ollama status.
+    """
+    from app.retrieval.ollama import generate, embed
+    try:
+        generate("Reply with one word: ready", num_predict=4)
+        embed(["warmup"])
+        logger.info("Ollama generation and embedding models warmed")
+    except Exception:
+        logger.warning("Ollama warm-up skipped (service may be unavailable)", exc_info=True)
+
+
 def startup_recovery():
     db.initialize()
     # This build is single-user and loopback-only. Preserve all existing records,
@@ -48,10 +62,23 @@ def startup_recovery():
         except Exception:
             logger.exception("Startup reconciliation encountered an error; data was not cleared.")
     start_queue()
+    # Warm in the background so startup stays responsive and the first question
+    # does not also pay model load time.
+    threading.Thread(target=_warm_models, daemon=True).start()
 
-@app.on_event("shutdown")
 def shutdown():
     shutdown_queue()
+
+@asynccontextmanager
+async def lifespan(_app):
+    startup_recovery()
+    try:
+        yield
+    finally:
+        shutdown()
+
+app = FastAPI(title="Offline Document Intelligence Chatbot", version="0.5.0-local",
+              lifespan=lifespan)
 
 @app.get("/")
 def root():
@@ -64,10 +91,24 @@ def health():
         db_health = {"available": True, "count": c.count(), "path": str(settings.chroma_path)}
     except Exception as e:
         db_health = {"available": False, "error": str(e)}
+    try:
+        document_count = len(list_docs())
+        metadata_health = {"available": True}
+    except Exception as e:
+        # A locked or unreadable metadata database should report a degraded
+        # service, not turn the whole health endpoint into a 500.
+        document_count = None
+        metadata_health = {"available": False, "error": str(e)}
+    try:
+        cache = cache_stats()
+    except Exception as e:
+        cache = {"enabled": None, "error": str(e)}
     o = status()
-    return {"status": "ok" if o.get("available") and db_health["available"] else "degraded",
-            "ollama": o, "chromadb": db_health, "documents": len(list_docs()),
-            "cache": cache_stats(),
+    healthy = o.get("available") and db_health["available"] and metadata_health["available"]
+    return {"status": "ok" if healthy else "degraded",
+            "ollama": o, "chromadb": db_health, "metadata": metadata_health,
+            "documents": document_count,
+            "cache": cache,
             "sqlite_path": str(settings.sqlite_path), "data_path": str(settings.data_path), "uploads_path": str(settings.uploads_path),
             "extracted_path": str(settings.extracted_path), "jobs_path": str(settings.jobs_path),
             "logs_path": str(settings.logs_path), "limits": {"max_file_mb": settings.max_file_mb,
@@ -154,7 +195,9 @@ def retry_job(job_id: str):
     if not job: raise HTTPException(404, "Job not found.")
     if job["status"] != "failed": raise HTTPException(409, "Only failed jobs can be retried.")
     if not Path(job["staged_path"]).exists(): raise HTTPException(410, "Staged file is missing; upload it again.")
-    db.update_job(job_id, status="queued", stage="Queued for retry", progress=0, updated_at=datetime.now(timezone.utc).isoformat(), error=None)
+    # Atomic transition: two simultaneous retry clicks must not both queue the job.
+    if not db.requeue_failed_job(job_id):
+        raise HTTPException(409, "Only failed jobs can be retried.")
     submit(job_id)
     return {"job_id": job_id, "status": "queued"}
 

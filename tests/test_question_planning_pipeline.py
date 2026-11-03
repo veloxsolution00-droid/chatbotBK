@@ -49,6 +49,9 @@ def test_chat_runs_each_decomposed_requirement(monkeypatch):
     import sys, types
     monkeypatch.setitem(sys.modules, "chromadb", types.ModuleType("chromadb"))
     import app.rag.chat as chat
+    # This test exercises decomposition capacity, so it must not depend on the
+    # deployment's MAX_QUESTION_PARTS cap.
+    monkeypatch.setattr(chat.settings, "max_question_parts", 10)
     monkeypatch.setattr(chat, "list_docs", lambda owner_id: [
         {"document_id": "d1", "processing_status": "indexed", "indexing_status": "complete"}
     ])

@@ -54,7 +54,7 @@ def main():
     if any(j.get("status")!="complete" for j in last.values()): print("WARNING: at least one ingestion job did not complete successfully.")
     def run_chat(i):
         t=time.perf_counter()
-        response=requests.post(base+"/chat",headers=headers,json={"question":args.question},timeout=600)
+        response=requests.post(base+"/chat",headers=headers,json={"question":args.question},timeout=args.timeout)
         elapsed=time.perf_counter()-t; response.raise_for_status(); data=response.json()
         return i, elapsed, data
     count=max(1,min(args.concurrent,50))

@@ -48,7 +48,9 @@ class Settings(BaseSettings):
     ingestion_workers: int = 1
     inference_concurrency: int = 1
     temperature: float = 0.0
-    timeout: int = 90
+    # Per-Ollama-call limit. Must exceed the slowest single generation on the
+    # host; CPU-only inference of a grounded answer routinely passes 90 s.
+    timeout: int = 300
     tesseract_cmd: str = ""
     ocr_enabled: bool = True
     max_pdf_pages: int = 5000
@@ -57,6 +59,10 @@ class Settings(BaseSettings):
     max_question_parts: int = 10
     max_context_chars: int = 9000
     verify_answers: bool = True
+    # Decode caps in tokens. A small local model keeps generating until it emits
+    # an end token, and that decode time is the dominant cost on CPU.
+    answer_max_tokens: int = 220
+    verify_max_tokens: int = 8
     recovery_on_startup: bool = True
 
     # Local, bounded cache. Cache data is disposable and stored separately from
@@ -93,6 +99,13 @@ class Settings(BaseSettings):
         }
         for key, default in defaults.items():
             value = getattr(self, key)
-            setattr(self, key, Path(value).expanduser().resolve() if value else default.resolve())
+            if value:
+                path = Path(value).expanduser()
+                # A relative override is documented as project-relative. Resolving
+                # it against the process CWD made launcher scripts and manual
+                # starts write to different folders.
+                setattr(self, key, path if path.is_absolute() else (ROOT / path).resolve())
+            else:
+                setattr(self, key, default.resolve())
 
 settings = Settings()

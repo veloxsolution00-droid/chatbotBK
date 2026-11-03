@@ -5,7 +5,8 @@ from app.core.config import settings
 
 # Keep local inference bounded on low-memory machines. Ollama remains responsible
 # for model lifetime; this semaphore prevents this API from flooding it with work.
-_MODEL_SLOT = BoundedSemaphore(value=1)
+# The configured inference_concurrency was previously ignored (always 1).
+_MODEL_SLOT = BoundedSemaphore(value=max(1, int(settings.inference_concurrency)))
 
 
 class OllamaUnavailableError(RuntimeError):
@@ -167,7 +168,24 @@ def embed_query(text):
     put_embedding(cache_text, settings.embedding_model, vector)
     return vector
 
-def generate(prompt):
+# Keep the generation model resident between the closely spaced calls of a single
+# chat request (generate -> optional retry -> verify). On CPU-only hosts Ollama
+# otherwise unloads the model between calls, and each reload is paid again as
+# latency. This is a residency hint only; Ollama still evicts the model when the
+# window lapses, so it does not pin memory indefinitely.
+_MODEL_KEEP_ALIVE = "30m"
+
+
+def generate(prompt, num_predict=None):
+    """Run one completion, capped so a small model cannot ramble on CPU.
+
+    ``num_predict`` overrides the configured answer cap for callers that need a
+    much shorter reply, such as the one-word verifier verdict.
+    """
+    cap = settings.answer_max_tokens if num_predict is None else num_predict
+    options = {"temperature": settings.temperature, "num_ctx": 4096}
+    if cap:
+        options["num_predict"] = max(1, int(cap))
     with _MODEL_SLOT:
         result = _request_model(
             settings.generation_model,
@@ -176,7 +194,8 @@ def generate(prompt):
                 "model": settings.generation_model,
                 "prompt": prompt,
                 "stream": False,
-                "options": {"temperature": settings.temperature, "num_ctx": 4096},
+                "keep_alive": _MODEL_KEEP_ALIVE,
+                "options": options,
             },
             settings.timeout,
         )

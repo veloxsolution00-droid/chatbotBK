@@ -48,7 +48,7 @@ def test_verifier_rejects_an_unsupported_draft(monkeypatch):
     monkeypatch.setitem(sys.modules, "chromadb", types.ModuleType("chromadb"))
     import app.rag.chat as chat
     monkeypatch.setattr(chat.settings, "verify_answers", True)
-    monkeypatch.setattr(chat, "generate", lambda prompt: "UNSUPPORTED")
+    monkeypatch.setattr(chat, "generate", lambda prompt, **_kwargs: "UNSUPPORTED")
 
     assert not chat._verify_answer("question", "evidence", "draft")
 

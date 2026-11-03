@@ -34,6 +34,12 @@ def evaluate_expression(expression: str) -> float:
         raise ValueError("Division by zero") from exc
     return result
 
+# A four-digit year joined by a hyphen is a date or an identifier, not
+# arithmetic: "2024-2025" means a year range, not -1. Expressions written with
+# spaces (for example "2026 - 42") are still treated as subtraction.
+_YEAR_OR_DATE = re.compile(r"^(?:19|20)\d{2}-(?:\d{1,2}(?:-\d{1,2})?|\d{4})$")
+
+
 def direct_calculation(question: str) -> dict | None:
     """Calculate only explicit expressions or simple 'X percent of Y' questions."""
     q = (question or "").strip()
@@ -45,10 +51,15 @@ def direct_calculation(question: str) -> dict | None:
     # accidental evaluation of document identifiers or dates.
     if not re.search(r"(?i)\b(calculate|compute|what is|evaluate)\b", q):
         return None
-    match = re.search(r"(?<![\w.])\d+(?:\.\d+)?(?:\s*[+*/%()-]\s*\d+(?:\.\d+)?)+(?![\w.])", q)
+    # Do not start or end a match inside an identifier, date, path, or version.
+    # The earlier lookbehind only excluded word characters, so "INV-2026-42"
+    # could be read as "2026-42".
+    match = re.search(r"(?<![\w.:/-])\d+(?:\.\d+)?(?:\s*[+*/%()-]\s*\d+(?:\.\d+)?)+(?![\w.:/-])", q)
     if not match:
         return None
     expr = match.group(0)
+    if _YEAR_OR_DATE.match(expr.strip()):
+        return None
     try:
         result = evaluate_expression(expr)
     except (ValueError, SyntaxError):

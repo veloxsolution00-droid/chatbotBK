@@ -1,10 +1,67 @@
 from pathlib import Path
-import json, csv, shutil, xml.etree.ElementTree as ET
+import json, csv, shutil, re, xml.etree.ElementTree as ET
+from html.parser import HTMLParser
 SUPPORTED={".pdf",".docx",".txt",".md",".log",".html",".htm",".rtf",".odt",".jpg",".jpeg",".png",".tif",".tiff",".bmp",".webp",
            ".xlsx",".xlsm",".ods",".csv",".pptx",".json",".xml",".yaml",".yml",".eml"}
 
 class NoReadableTextError(ValueError):
     """The file was processed successfully but contains no indexable text."""
+
+
+class _VisibleTextParser(HTMLParser):
+    """Extract human-visible text while dropping scripts/styles and tags."""
+
+    _BLOCK_TAGS = {"p", "br", "div", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "section", "article", "table"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self._parts = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in {"script", "style", "noscript"}:
+            self._skip_depth += 1
+        elif tag in self._BLOCK_TAGS:
+            self._parts.append("\n")
+        elif tag in {"td", "th"}:
+            self._parts.append(" | ")
+
+    def handle_endtag(self, tag):
+        if tag in {"script", "style", "noscript"} and self._skip_depth:
+            self._skip_depth -= 1
+        elif tag in self._BLOCK_TAGS:
+            self._parts.append("\n")
+
+    def handle_data(self, data):
+        if not self._skip_depth:
+            self._parts.append(data)
+
+    def text(self):
+        return re.sub(r"\n{3,}", "\n\n", "".join(self._parts)).strip()
+
+
+def _html_to_text(markup):
+    parser = _VisibleTextParser()
+    try:
+        parser.feed(str(markup or ""))
+        parser.close()
+        return parser.text()
+    except Exception:
+        # Malformed HTML should not make an otherwise readable file fail; fall
+        # back to the raw text rather than discarding user content.
+        return re.sub(r"\s+", " ", str(markup or "")).strip()
+
+
+def _text_encoding(path):
+    """Pick a practical encoding for delimited/text files without failing on one byte."""
+    sample = Path(path).open("rb").read(65536)
+    for encoding in ("utf-8-sig", "cp1252", "latin-1"):
+        try:
+            sample.decode(encoding)
+            return encoding
+        except UnicodeDecodeError:
+            continue
+    return "utf-8"
 
 
 def _get_tesseract():
@@ -26,7 +83,7 @@ def _row_text(row):
 
 
 def _csv_blocks(path, rows_per_block):
-    with open(path, encoding="utf-8-sig", newline="") as f:
+    with open(path, encoding=_text_encoding(path), errors="replace", newline="") as f:
         reader = csv.reader(f)
         header = next(reader, None)
         if header is None:
@@ -82,7 +139,10 @@ def iter_extract(path):
     ext=Path(path).suffix.lower(); yielded = False
     if ext not in SUPPORTED: raise ValueError(f"Unsupported extension: {ext}")
     if ext==".pdf":
-        import pymupdf
+        try:
+            import pymupdf
+        except ImportError:  # PyMuPDF 1.24.0-1.24.2 only ships the legacy module name
+            import fitz as pymupdf
         with pymupdf.open(path) as pdf:
             if pdf.page_count > settings.max_pdf_pages:
                 raise ValueError(f"PDF has {pdf.page_count} pages, above the configured MAX_PDF_PAGES limit of {settings.max_pdf_pages}.")
@@ -119,8 +179,10 @@ def iter_extract(path):
             text = pytess.image_to_string(ImageOps.grayscale(image)).strip()
         if text: yielded = True; yield ("image", text)
     elif ext in {".txt", ".md", ".log", ".html", ".htm", ".yaml", ".yml", ".rtf"}:
-        text=Path(path).read_text(encoding="utf-8",errors="replace")
-        if ext==".rtf":
+        text=Path(path).read_text(encoding=_text_encoding(path),errors="replace")
+        if ext in {".html", ".htm"}:
+            text=_html_to_text(text)
+        elif ext==".rtf":
             from striprtf.striprtf import rtf_to_text
             text=rtf_to_text(text)
         if text.strip(): yielded = True; yield ("document",text)
@@ -136,7 +198,8 @@ def iter_extract(path):
             text="\n".join(sh.text for sh in s.shapes if hasattr(sh,"text") and sh.text.strip())
             if text: yielded = True; yield (f"slide {i}",text)
     elif ext==".json":
-        text = json.dumps(json.loads(Path(path).read_text(encoding="utf-8")),ensure_ascii=False,indent=2)
+        text = Path(path).read_text(encoding=_text_encoding(path), errors="replace").lstrip("\ufeff")
+        text = json.dumps(json.loads(text),ensure_ascii=False,indent=2)
         if text.strip(): yielded = True; yield ("JSON", text)
     elif ext==".xml":
         text = ET.tostring(ET.parse(path).getroot(),encoding="unicode")
@@ -144,8 +207,11 @@ def iter_extract(path):
     elif ext==".eml":
         from email import policy
         from email.parser import BytesParser
-        m=BytesParser(policy=policy.default).parsebytes(Path(path).read_bytes()); body=m.get_body(preferencelist=("plain",))
-        text = f"Subject: {m.get('subject','')}\nFrom: {m.get('from','')}\n"+(body.get_content() if body else "")
+        m=BytesParser(policy=policy.default).parsebytes(Path(path).read_bytes()); body=m.get_body(preferencelist=("plain","html"))
+        content = body.get_content() if body else ""
+        if body is not None and body.get_content_type() == "text/html":
+            content = _html_to_text(content)
+        text = f"Subject: {m.get('subject','')}\nFrom: {m.get('from','')}\n"+content
         if text.strip(): yielded = True; yield ("email", text)
     elif ext==".odt":
         import zipfile

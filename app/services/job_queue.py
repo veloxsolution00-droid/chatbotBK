@@ -13,8 +13,13 @@ _executor = None
 def now(): return datetime.now(timezone.utc).isoformat()
 
 def _run(job_id):
+    # Claim the job atomically first: a queued job must never be processed by
+    # two workers at the same time (double retry, or recovery racing an upload).
+    if not db.claim_job(job_id):
+        return
     job = db.get_job(job_id)
-    if not job or job["status"] == "complete": return
+    if not job:
+        return
     path = Path(job["staged_path"])
     db.update_job(job_id, status="processing", stage="Starting", progress=1, updated_at=now(), error=None)
     try:
@@ -39,6 +44,9 @@ def start_queue():
     global _executor
     if _executor is None:
         _executor = ThreadPoolExecutor(max_workers=max(1, min(settings.ingestion_workers, 2)), thread_name_prefix="doc-ingest")
+        # A previous process may have died mid-ingestion. Requeue those jobs
+        # before listing recoverable work so they are not stuck at 'processing'.
+        db.reset_processing_jobs()
     for job in db.recoverable_jobs():
         _executor.submit(_run, job["job_id"])
 

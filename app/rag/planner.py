@@ -51,14 +51,15 @@ def task_guidance(intent: str) -> str:
     return {
         "scenario": ("Use a structured scenario analysis: list documented rules with citations; list assumptions supplied by the user; "
                      "apply only rules that actually cover the scenario; identify missing conditions, exceptions, and missing rules; "
-                     "state the conclusion and its limits. Do not invent a policy or infer permission from silence."),
-        "comparison": "Compare each requested item using the same criteria. Cite evidence for each side; explicitly mark criteria with missing evidence.",
-        "summary": "Synthesize the important points from all relevant evidence, grouped by theme. Preserve exceptions and cite sources.",
+                     "state the conclusion and its limits. Do not invent a policy or infer permission from silence. "
+                     "If the documents do not cover this scenario, state that clearly."),
+        "comparison": "Compare each requested item using the same criteria. Cite evidence for each side; explicitly mark criteria with missing evidence. If items are missing from documents, do not invent details.",
+        "summary": "Synthesize the important points from all relevant evidence, grouped by theme. Preserve exceptions and cite sources. If no relevant info exists, state that clearly.",
         "calculation": "Prefer deterministic calculation when the question contains a directly evaluable expression. Otherwise identify inputs, formula, units, and assumptions; do not invent missing inputs.",
-        "explanation": "Explain only mechanisms and reasons supported by evidence. Label inferences and distinguish them from explicit statements.",
-        "followup": "Resolve the short follow-up from the supplied conversation context, then answer only from retrieved document evidence.",
-        "factual": "Answer directly, preserve qualifications, and distinguish explicit facts from inference.",
-    }.get(intent, "Answer directly using only the evidence.")
+        "explanation": "Explain only mechanisms and reasons supported by evidence. Label inferences and distinguish them from explicit statements. If the evidence is insufficient to explain, say so.",
+        "followup": "Resolve the short follow-up from the supplied conversation context, then answer only from retrieved document evidence. If the evidence doesn't answer it, abstain.",
+        "factual": "Answer directly using only the evidence. If the information is not in the documents, you must state that you cannot find it.",
+    }.get(intent, "Answer directly using only the evidence. If not found, say so.")
 
 
 def correct_query_from_vocabulary(question: str, vocabulary: list[str], cutoff: float = 0.86) -> str:

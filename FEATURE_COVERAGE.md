@@ -34,7 +34,7 @@ This matrix is intentionally explicit: **implemented** means code exists and has
 | Health/status diagnostics | Implemented | `/health` includes Ollama, ChromaDB, storage paths, configured limits, and local cache counts/hit/miss metrics. |
 | Upload limits / supported-extension checks | Implemented | Per-file, batch-size, file-count and extension validation. |
 | Evaluation runner | Implemented, requires user's gold cases | API evaluation harness checks expected answer terms, abstention, sources, question type, and history. Example cases are placeholders. |
-| Unit/regression tests | Passed in build environment | `67 passed, 1 skipped`; skipped test needs ChromaDB package. See `IMPLEMENTATION_AUDIT.md`. |
+| Unit/regression tests | Passed in build environment | `87 passed, 0 skipped` with Python 3.11.9 and with the project `.venv`. See `IMPLEMENTATION_AUDIT.md`. |
 | Real Ollama + ChromaDB end-to-end test | Not run in this environment | Requires target Windows machine, installed dependencies, and local models. |
 | Network-disabled/offline proof | Not run in this environment | Must disconnect/disable network after setup and test upload, retrieval, and chat. |
 | 200 MB workload / latency / memory benchmark | Not run in this environment | Use `performance.md` and record upload, extraction, embedding/indexing, query latency, RAM, and disk usage on target hardware. |
