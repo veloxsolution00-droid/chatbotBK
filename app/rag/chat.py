@@ -76,6 +76,163 @@ _COMMON_TYPOS = {
     "summery": "summary", "teh": "the", "recieve": "receive",
 }
 
+
+# --- Question Analysis Helper Functions ---
+
+def has_document_anchor_in_question(normalized: str) -> bool:
+    """Check if the question contains document-specific anchors (filenames, page refs, etc.)."""
+    anchors = re.findall(r"\[(\d+)\]", normalized or "")
+    if anchors:
+        return True
+    # Check for filename patterns
+    if re.search(r"\b(?:page|paragraph|section)\s+\d+", normalized or "", re.I):
+        return True
+    # Check for "according to the document" type phrases
+    if re.search(r"\b(according to|as stated in|the document|the file|pdf|doc)\b", normalized or "", re.I):
+        return True
+    return False
+
+
+def _has_specific_entities(normalized: str) -> bool:
+    """Check if the question contains named entities that would anchor it to specific documents."""
+    # Capitalized proper nouns, dates, etc.
+    if re.search(r"\b[A-Z][a-z]+(?: [A-Z][a-z]+)*\b", normalized or ""):
+        return True
+    # Dates in various formats
+    if re.search(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", normalized or ""):
+        return True
+    return False
+
+
+# --- Question Analysis & Clarification ---
+
+def _analyze_question(normalized: str, task_type: str, original: str) -> dict:
+    """Analyze the question before retrieval to determine if early abstention is warranted,
+    and what retrieval parameters to use.
+
+    Returns {"abstain_early": bool, "reason": str | None, "analysis": dict}
+    """
+    # 1. Check if this is a "question bank" document pattern:
+    #    The user is asking about a document that contains only questions.
+    #    We detect this by looking for question-heavy queries.
+    question_markers = len(re.findall(r"\?", normalized)) if normalized else 0
+    sentence_count = len([s for s in re.split(r"[.!?]+", normalized) if s.strip()]) if normalized else 0
+    is_question_bank_query = (
+        sentence_count > 0 and question_markers / max(1, sentence_count) > 0.6
+    )
+
+    # 2. Detect if the user is asking for a definition/concept that may not
+    #    be in the documents. If the question uses very general terms without
+    #    document-specific anchors, flag for potential abstention.
+    # Note: We only abstain for genuinely general queries, not normal factual
+    # questions that should be answered from documents.
+    general_terms = {"thing", "stuff", "matter", "issue", "topic", "concept"}
+    has_general_anchor = bool(re.search(r"\b\w+ \w+\b", normalized or ""))
+    # Only flag lacks_document_anchor if the query is truly general (no proper
+    # nouns, no dates, no specific entities). Questions like "What is X?" or
+    # "Who is X?" should always proceed to retrieval.
+    lacks_document_anchor = (
+        not has_document_anchor_in_question(normalized) and
+        not _has_specific_entities(normalized) and
+        question_markers / max(1, sentence_count) > 0.8  # very question-heavy
+    )
+
+    # 3. Detect calculation questions already handled, but catch edge cases
+    is_calculation = task_type == "calculation" or re.search(r"\d+\s*(%|plus|minus|times|multiplied|divided)", normalized or "")
+
+    # 4. Determine if early abstention is warranted
+    abstain_reasons = []
+    if is_question_bank_query:
+        abstain_reasons.append("question_bank_query")
+    if lacks_document_anchor and not is_calculation:
+        abstain_reasons.append("no_document_anchor")
+    if is_calculation and direct_calculation(normalized) is None:
+        abstain_reasons.append("calculation_not_deterministic")
+
+    abstain_early = len(abstain_reasons) >= 1
+    reason = "; ".join(abstain_reasons) if abstain_early else None
+
+    analysis = {
+        "is_question_bank_query": is_question_bank_query,
+        "question_markers": question_markers,
+        "sentence_count": sentence_count,
+        "lacks_document_anchor": lacks_document_anchor,
+        "has_general_anchor": has_general_anchor,
+        "lacks_document_anchor_detail": "Query uses general terms without document-specific anchors" if lacks_document_anchor else None,
+        "is_calculation": is_calculation,
+        "abstain_reasons": abstain_reasons,
+    }
+
+    return {
+        "abstain_early": abstain_early,
+        "reason": reason,
+        "analysis": analysis,
+    }
+
+
+def _has_document_anchor_in_question(normalized: str) -> bool:
+    """Check if the question contains document-specific anchors (filenames, page refs, etc.)."""
+    anchors = re.findall(r"\[(\d+)\]", normalized or "")
+    if anchors:
+        return True
+    # Check for filename patterns
+    if re.search(r"\b(?:page|paragraph|section)\s+\d+", normalized or "", re.I):
+        return True
+    # Check for "according to the document" type phrases
+    if re.search(r"\b(according to|as stated in|the document|the file|pdf|doc)\b", normalized or "", re.I):
+        return True
+    return False
+
+
+def _has_specific_entities(normalized: str) -> bool:
+    """Check if the question contains named entities that would anchor it to specific documents."""
+    # Capitalized proper nouns, dates, etc.
+    if re.search(r"\b[A-Z][a-z]+(?: [A-Z][a-z]+)*\b", normalized or ""):
+        return True
+    # Dates in various formats
+    if re.search(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", normalized or ""):
+        return True
+    return False
+
+
+def _get_retrieval_params(task_type: str, analysis: dict) -> dict:
+    """Return retrieval configuration adjusted for the question type and analysis.
+
+    Key adjustments:
+    - top_k per question type
+    - min_similarity thresholds
+    - Whether to include keyword search fallback
+    """
+    base_top_k = settings.top_k  # default from config
+    base_min_sim = settings.min_similarity
+
+    # Adjust top_k by question type
+    type_adjustments = {
+        "factual": 1,        # default
+        "explanation": 2,    # may need more chunks for coherence
+        "summary": 3,        # may need more chunks
+        "calculation": 1,    # usually 1 good chunk suffices
+        "comparison": 3,     # need multiple chunks for both sides
+        "factual": 1,
+    }
+    adjusted_top_k = base_top_k
+    if task_type in type_adjustments:
+        # Don't reduce below 1 or increase unreasonably
+        adjusted_top_k = max(1, min(base_top_k + type_adjustments[task_type], 10))
+
+    # For question-bank queries, use higher similarity threshold
+    if analysis.get("is_question_bank_query"):
+        adjusted_min_sim = max(base_min_sim, 0.50)  # be more selective
+    else:
+        adjusted_min_sim = base_min_sim
+
+    return {
+        "top_k": adjusted_top_k,
+        "min_similarity": adjusted_min_sim,
+        "prefer_keyword": not analysis.get("is_question_bank_query", False),
+        "question_type": task_type,
+    }
+
 def normalize_question(question):
     cleaned = unicodedata.normalize("NFKC", question).replace("\u2018", "'").replace("\u2019", "'")
     # Repair accidental punctuation inserted inside a word (e.g. "bra,m" -> "bram")
@@ -353,6 +510,25 @@ def _answer_one(question, indexed, owner_id, doc_types=None):
     doc_types = doc_types or {}
     normalized = normalize_question(question)
     task_type = classify_question(normalized)
+    
+    # --- QUESTION ANALYSIS & CLARIFICATION (runs before retrieval) ---
+    # 1. Detect question-bank documents: if >80% of sentences are questions,
+    #    the document contains questions only, not answers.
+    # 2. Detect if question needs decomposition into sub-questions.
+    # 3. Early abstention for known-unanswerable patterns.
+    question_analysis = _analyze_question(normalized, task_type, question)
+    if question_analysis["abstain_early"]:
+        return {"question": question, "status": "insufficient_evidence",
+                "answer": ABSTENTION, "sources": [], "abstained": True,
+                "retrieval": {"indexed_documents": len(indexed) if indexed else 0,
+                              "candidate_chunks": 0, "selected_chunks": 0,
+                              "best_similarity": None,
+                              "top_k": settings.top_k, "min_similarity": settings.min_similarity,
+                              "early_abstention": True,
+                              "analysis": question_analysis["reason"]}}
+    
+    # 2. Adjust retrieval parameters based on question type
+    retrieval_params = _get_retrieval_params(task_type, question_analysis)
     # Explicit arithmetic supplied by the user can be evaluated deterministically;
     # it is intentionally not cached as a document-grounded answer.
     direct_result = direct_calculation(normalized) if task_type == "calculation" else None
